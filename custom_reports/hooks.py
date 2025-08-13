@@ -8,7 +8,7 @@ app_license = "mit"
 # Apps
 # ------------------
 
-# required_apps = []
+required_apps = ["erpnext"]
 
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
@@ -242,3 +242,10 @@ app_license = "mit"
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
 
+# Optional: Fixtures if you have custom fields/workspaces
+fixtures = [
+    {
+        "doctype": "Workspace",
+        "filters": [["module", "=", "Custom Stock Reports"]]
+    }
+]
