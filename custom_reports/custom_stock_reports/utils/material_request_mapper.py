@@ -1,6 +1,7 @@
 import frappe, json
 from frappe.utils import flt, nowdate
-from erpnext.manufacturing.report.production_planning_report.production_planning_report import execute as run_report
+#from erpnext.manufacturing.report.production_planning_report.production_planning_report import execute as run_report
+from custom_reports.custom_stock_reports.report.custom_production_planning_report.custom_production_planning_report import execute as run_report
 
 @frappe.whitelist()
 def get_material_request_data_from_report(filters=None):
@@ -60,3 +61,4 @@ def get_material_request_data_from_report(filters=None):
         })
 
     return {"items": items}
+
