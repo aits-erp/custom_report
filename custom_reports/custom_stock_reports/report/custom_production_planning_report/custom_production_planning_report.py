@@ -136,7 +136,7 @@ class ProductionPlanReport:
 		rows = frappe.db.sql(sql, params, as_dict=True)
 		# store as simple dict for quick lookup
 		self.po_qty_map = {r.item_code: (r.po_qty or 0) for r in rows}
-		frappe.msgprint(f"PO map sample: {dict(list(self.po_qty_map.items())[:10])}")
+		#frappe.msgprint(f"PO map sample: {dict(list(self.po_qty_map.items())[:10])}")
 
 	def get_open_orders(self):
 		doctype, order_by = self.filters.based_on, self.filters.order_by
@@ -328,7 +328,7 @@ class ProductionPlanReport:
 		# Merge discovered warehouses into self.warehouses
 		self.warehouses = list(set(self.warehouses or []) | found_whs)
 
-		frappe.msgprint(f"bins found for items: {len(bins)}; warehouses discovered: {len(found_whs)}")
+		#frappe.msgprint(f"bins found for items: {len(bins)}; warehouses discovered: {len(found_whs)}")
 
 	def get_purchase_details(self):
 			if not (self.orders and self.raw_materials_dict):
@@ -350,88 +350,133 @@ class ProductionPlanReport:
 					self.purchase_details.setdefault(key, d)
 
 	def prepare_data(self):
+		"""
+		Prepares enriched data for each order by attaching:
+		- Exact warehouse availability (from Bin table)
+		- Pending PO quantities
+		- Parent warehouse stock snapshot (all warehouses, negatives preserved)
+		- Normalized raw material / delivery info
+		"""
+
 		if not self.orders:
 			return
 
 		for order in self.orders:
+			# Determine key based on filter
 			key = order.name if self.filters.based_on == "Work Order" else order.bom_no
+
+			# Skip if no raw materials found for this key
 			if not self.raw_materials_dict.get(key):
 				continue
 
+			# Initialize defaults
 			order.update({
 				"for_warehouse": order.warehouse,
-				"available_qty": 0,
+				"available_qty": 0,   # will be filled if bin has stock
 			})
 
+			# Normalize fields if missing
 			if not getattr(order, "raw_material_code", None):
 				order.raw_material_code = order.get("item_code")
 			if not getattr(order, "delivery_date", None):
 				order.delivery_date = order.get("schedule_date")
 
-			# Available qty from bin (exact warehouse match)
+			# --- 1. Bin Availability (exact warehouse match) ---
 			bin_data = self.bin_details.get((order.production_item, order.warehouse)) or {}
-			if bin_data and bin_data.get("actual_qty") > 0 and order.qty_to_manufacture:
-				order.available_qty = min(order.qty_to_manufacture, bin_data.get("actual_qty"))
-				bin_data["actual_qty"] -= order.available_qty
+			if bin_data and order.qty_to_manufacture:
+				# consume qty from bin up to required
+				available = min(order.qty_to_manufacture, bin_data.get("actual_qty", 0))
+				order.available_qty = available
+				# reduce bin stock accordingly
+				bin_data["actual_qty"] = bin_data.get("actual_qty", 0) - available
 
-			# PO quantities
+			# --- 2. Purchase Order Quantities ---
 			po_qty = self.po_qty_map.get(order.production_item, 0)
 			order.arrival_qty = po_qty
+			# Balance PO qty cannot be negative (we only track shortfall)
 			order.balance_po_qty = max(order.qty_to_manufacture - po_qty, 0)
-			frappe.msgprint(f"PO Qty for {order.production_item}: {po_qty}, Balance PO Qty: {order.balance_po_qty}")
 
-			# Parent warehouse quantities
+			# --- 3. Parent Warehouse Quantities (ALL warehouses, negatives kept) ---
 			for wh in self.parent_warehouses:
 				fieldname = frappe.scrub(f"{wh}_qty")
 				qty_val = self.parent_qty_map.get(order.production_item, {}).get(wh, 0)
+				# Keep negatives as-is (user can filter later)
 				order[fieldname] = qty_val
 
+			# --- 4. Update Raw Materials (propagates enriched values) ---
 			self.update_raw_materials(order, key)
 
 	def update_raw_materials(self, data, key):
 		"""
-		Iterate raw materials for this 'key' and call pick_materials_from_warehouses.
-		Preserves the original allocation logic; ensures safe default when raw_materials_dict.get(key) is None.
+		Update raw materials allocation for the given 'key'.
+		
+		- Iterates raw materials for the BOM/WO 'key'
+		- Preserves negatives (no forced clamping)
+		- Allocates required_qty from warehouses using pick_materials_from_warehouses
+		- Adds a fallback row if a custom raw_material_warehouse is set
 		"""
+
 		self.index = 0
 
-		# ensure we have an iterable (avoid NoneType)
+		# ensure we always have an iterable (avoid NoneType crash)
 		raw_materials_for_key = self.raw_materials_dict.get(key) or []
 
+		# fallback default (later overridden if needed)
 		warehouses = self.mrp_warehouses or []
 
 		for rm in raw_materials_for_key:
-			# compute required_qty for non-Work Order flows
-			if self.filters.based_on != "Work Order":
-				# rm.required_qty_per_unit exists in BOM path; if not present, fall back to rm.required_qty
-				rm.required_qty = getattr(rm, "required_qty_per_unit", None) and (rm.required_qty_per_unit * data.qty_to_manufacture) or getattr(rm, "required_qty", 0)
 
-			# determine "warehouses" list (same as original logic)
+			# ---- Compute required_qty ----
+			if self.filters.based_on != "Work Order":
+				# If BOM-based: required_qty_per_unit * qty_to_manufacture
+				# else fallback to rm.required_qty
+				per_unit = getattr(rm, "required_qty_per_unit", None)
+				rm.required_qty = (
+					(per_unit * data.qty_to_manufacture) if per_unit is not None
+					else getattr(rm, "required_qty", 0)
+				)
+
+			# ---- Decide warehouse list ----
 			if not warehouses:
+				# no global list, fall back to "data.warehouse"
 				warehouses = [data.warehouse]
 
 			if self.filters.based_on == "Work Order" and getattr(rm, "warehouse", None):
+				# In Work Order mode, raw material row warehouse takes priority
 				warehouses = [rm.warehouse]
 			else:
+				# otherwise, use default_warehouse from item_details if present
 				item_details = self.item_details.get(rm.item_code)
-				if item_details:
+				if item_details and item_details.get("default_warehouse"):
 					warehouses = [item_details["default_warehouse"]]
 
+			# explicit override: use children of selected raw_material_warehouse
 			if self.filters.raw_material_warehouse:
 				warehouses = get_child_warehouses(self.filters.raw_material_warehouse)
-			# remaining qty initialization and allocate from warehouses
-			rm.remaining_qty = rm.required_qty
+
+			# ---- Allocation ----
+			rm.remaining_qty = rm.required_qty  # start with total requirement
 			self.pick_materials_from_warehouses(rm, data, warehouses)
 
-			# If leftover qty needs to be shown with the chosen raw_material_warehouse
-			if rm.remaining_qty and self.filters.raw_material_warehouse and rm.remaining_qty != rm.required_qty:
+			# ---- Handle leftover qty case ----
+			# If user selected a "raw_material_warehouse", and partial qty allocated,
+			# we must still show remaining_qty row so that report matches stock reality.
+			if (
+				rm.remaining_qty
+				and self.filters.raw_material_warehouse
+				and rm.remaining_qty != rm.required_qty
+			):
+				# construct fallback row
 				row = self.get_args()
 				rm.warehouse = self.filters.raw_material_warehouse
 				rm.required_qty = rm.remaining_qty
 				rm.allotted_qty = 0
 				row.update(rm)
-				# enrich the fallback row with parent/PO columns as well
+
+				# enrich with parent / PO / other metadata
 				self._enrich_row_parent_po_fields(row, rm.item_code)
+
+				# push to report dataset
 				self.data.append(row)
 			
 	# updated pick_materials_from_warehouses (adds enrichment before append)
@@ -518,32 +563,34 @@ class ProductionPlanReport:
 	# 	frappe.msgprint(f"parent_qty_map sample: {dict(list(self.parent_qty_map.items())[:5])}")
 
 	def build_parent_warehouse_data(self):
-		"""Build raw_materials_dict with quantities grouped by parent warehouse.
-		Includes all warehouses, keeps 0 and negatives for display.
 		"""
-		self.raw_materials_dict = {}
+		Build:
+		- self.parent_warehouses: list of parent warehouse names
+		- self.parent_qty_map: { parent_wh: { item_code: qty, ... }, ... }
+		
+		Includes all warehouses, keeps 0 and negative values for display.
+		"""
+		warehouses = frappe.get_all("Warehouse", fields=["name", "parent_warehouse"])
+		wh_map = {w.name: w.parent_warehouse for w in warehouses}
 
-		for d in self.raw_materials:
-			item_code = d.item_code
-			warehouse = d.warehouse
-			qty = flt(d.qty)
+		stock_map = {}  # parent_wh -> { item_code: qty }
 
-			parent_warehouse = self.parent_warehouses.get(warehouse)
+		# Use bin_details, because that's where actual stock qtys are stored
+		for (item_code, wh), bin_data in (self.bin_details or {}).items():
+			qty = flt(bin_data.get("actual_qty", 0))
 
-			# Initialize if not already
-			if item_code not in self.raw_materials_dict:
-				self.raw_materials_dict[item_code] = {}
+			parent = wh_map.get(wh) or wh
+			stock_map.setdefault(parent, {})
+			stock_map[parent][item_code] = stock_map[parent].get(item_code, 0) + qty
 
-			# Always include warehouse, even if qty = 0 or negative
-			self.raw_materials_dict[item_code][parent_warehouse] = (
-				self.raw_materials_dict[item_code].get(parent_warehouse, 0) + qty
-			)
+		# Ensure every parent warehouse is included, even if qty=0
+		for wh in wh_map.values():
+			if not wh:
+				continue
+			stock_map.setdefault(wh, {})
 
-		# Ensure all parent warehouses exist in mapping, even if qty not found
-		for item_code in self.raw_materials_dict:
-			for parent_wh in self.parent_warehouses.values():
-				if parent_wh not in self.raw_materials_dict[item_code]:
-					self.raw_materials_dict[item_code][parent_wh] = 0
+		self.parent_qty_map = stock_map
+		self.parent_warehouses = sorted(stock_map.keys())
 
 	def get_columns(self):
 		based_on = self.filters.based_on
