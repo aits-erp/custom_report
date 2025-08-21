@@ -31,6 +31,7 @@ def get_material_request_data_from_report(filters=None):
             continue
 
         balance = flt(row.get("balance_po_qty") or 0)
+        frappe.log_error("Row Debug", f"{row.get('item_code') or row.get('raw_material_code')} => BalanceQty: {row.get('balance_po_qty')} | Parsed: {balance}")
         if balance <= 0:
             continue
 

@@ -79,31 +79,31 @@ class ProductionPlanReport:
 			self.parent_warehouses.add(parent_warehouse)
 		self.parent_warehouses = sorted(filter(None, self.parent_warehouses))
 
-	def get_parent_warehouse_qty_map(self):
-		# """Fetch total qty of each item for each parent warehouse"""
-		from frappe.utils.nestedset import get_descendants_of
-		qty_map = frappe._dict()
-		parent_warehouses = frappe.get_all(
-			"Warehouse",
-			filters={"is_group": 1},
-			pluck="name"
-		)
+	# def get_parent_warehouse_qty_map(self):
+	# 	# """Fetch total qty of each item for each parent warehouse"""
+	# 	from frappe.utils.nestedset import get_descendants_of
+	# 	qty_map = frappe._dict()
+	# 	parent_warehouses = frappe.get_all(
+	# 		"Warehouse",
+	# 		filters={"is_group": 1},
+	# 		pluck="name"
+	# 	)
 
-		for parent_wh in parent_warehouses:
-			child_whs = get_descendants_of("Warehouse", parent_wh)
-			if not child_whs:
-				continue
-			data = frappe.db.get_all(
-				"Bin",
-				filters={"warehouse": ["in", child_whs]},
-				fields=["item_code", "sum(actual_qty) as total_qty"],
-				group_by="item_code"
-			)
+	# 	for parent_wh in parent_warehouses:
+	# 		child_whs = get_descendants_of("Warehouse", parent_wh)
+	# 		if not child_whs:
+	# 			continue
+	# 		data = frappe.db.get_all(
+	# 			"Bin",
+	# 			filters={"warehouse": ["in", child_whs]},
+	# 			fields=["item_code", "sum(actual_qty) as total_qty"],
+	# 			group_by="item_code"
+	# 		)
 
-			for d in data:
-				qty_map.setdefault(parent_wh, {})[d.item_code] = d.total_qty or 0
+	# 		for d in data:
+	# 			qty_map.setdefault(parent_wh, {})[d.item_code] = d.total_qty or 0
 
-		self.parent_qty_map = qty_map
+	# 	self.parent_qty_map = qty_map
 
 	def get_po_qty_map(self):
 		# """
@@ -127,7 +127,7 @@ class ProductionPlanReport:
 
 		cond_sql = " AND ".join(conditions)
 		sql = f"""
-			SELECT poi.item_code AS item_code, SUM(poi.qty) AS po_qty
+			SELECT poi.item_code AS item_code, SUM(poi.qty - poi.received_qty) AS po_qty
 			FROM `tabPurchase Order Item` poi
 			JOIN `tabPurchase Order` po ON po.name = poi.parent
 			WHERE {cond_sql}
@@ -136,7 +136,7 @@ class ProductionPlanReport:
 		rows = frappe.db.sql(sql, params, as_dict=True)
 		# store as simple dict for quick lookup
 		self.po_qty_map = {r.item_code: (r.po_qty or 0) for r in rows}
-		#frappe.msgprint(f"PO map sample: {dict(list(self.po_qty_map.items())[:10])}")
+		frappe.msgprint(f"PO map sample: {dict(list(self.po_qty_map.items())[:10])}")
 
 	def get_open_orders(self):
 		doctype, order_by = self.filters.based_on, self.filters.order_by
@@ -328,7 +328,7 @@ class ProductionPlanReport:
 		# Merge discovered warehouses into self.warehouses
 		self.warehouses = list(set(self.warehouses or []) | found_whs)
 
-		#frappe.msgprint(f"bins found for items: {len(bins)}; warehouses discovered: {len(found_whs)}")
+		frappe.msgprint(f"bins found for items: {len(bins)}; warehouses discovered: {len(found_whs)}")
 
 	def get_purchase_details(self):
 			if not (self.orders and self.raw_materials_dict):
@@ -336,7 +336,7 @@ class ProductionPlanReport:
 			self.purchase_details = {}
 			purchased_items = frappe.get_all(
 				"Purchase Order Item",
-				fields=["item_code", "min(schedule_date) as arrival_date", "qty as arrival_qty", "warehouse"],
+				fields=["item_code", "min(schedule_date) as arrival_date", "sum(qty - received_qty) as arrival_qty", "warehouse"],
 				filters={
 					"item_code": ("in", self.item_codes),
 					"warehouse": ("in", self.warehouses),
@@ -348,46 +348,6 @@ class ProductionPlanReport:
 				key = (d.item_code, d.warehouse)
 				if key not in self.purchase_details:
 					self.purchase_details.setdefault(key, d)
-
-	# def prepare_data(self):
-	# 	if not self.orders:
-	# 		return
-	# 	for order in self.orders:
-	# 		# Determine key for raw materials lookup
-	# 		key = order.name if self.filters.based_on == "Work Order" else order.bom_no
-	# 		if not self.raw_materials_dict.get(key):
-	# 			continue
-
-	# 		# 1. Initialize defaults
-	# 		order.update({
-	# 			"for_warehouse": order.warehouse,
-	# 			"available_qty": 0,
-	# 		})
-
-	# 		# Preserve raw material code/date if not already set
-	# 		if not getattr(order, "raw_material_code", None):
-	# 			order.raw_material_code = order.get("item_code")
-	# 		if not getattr(order, "delivery_date", None):
-	# 			order.delivery_date = order.get("schedule_date")
-
-	# 		# 2. Available qty from bin
-	# 		bin_data = self.bin_details.get((order.production_item, order.warehouse)) or {}
-	# 		if bin_data and bin_data.get("actual_qty") > 0 and order.qty_to_manufacture:
-	# 			order.available_qty = min(order.qty_to_manufacture, bin_data.get("actual_qty"))
-	# 			bin_data["actual_qty"] -= order.available_qty
-	# 		# 3. Add PO quantities
-	# 		po_qty = self.po_qty_map.get(order.production_item, 0)
-	# 		order.arrival_qty = po_qty
-	# 		order.balance_po_qty = max(order.qty_to_manufacture - po_qty, 0)
-
-	# 		# 4. Add parent warehouse quantities
-	# 		for wh in self.parent_warehouses:
-	# 			fieldname = frappe.scrub(f"{wh}_qty")
-	# 			qty_val = self.parent_qty_map.get(order.production_item, {}).get(wh, 0)
-	# 			order[fieldname] = qty_val
-
-	# 		# 5. Update raw materials allocation
-	# 		self.update_raw_materials(order, key)
 
 	def prepare_data(self):
 		if not self.orders:
@@ -418,6 +378,7 @@ class ProductionPlanReport:
 			po_qty = self.po_qty_map.get(order.production_item, 0)
 			order.arrival_qty = po_qty
 			order.balance_po_qty = max(order.qty_to_manufacture - po_qty, 0)
+			frappe.msgprint(f"PO Qty for {order.production_item}: {po_qty}, Balance PO Qty: {order.balance_po_qty}")
 
 			# Parent warehouse quantities
 			for wh in self.parent_warehouses:
@@ -530,31 +491,59 @@ class ProductionPlanReport:
 			}
 		)
 	
+	# def build_parent_warehouse_data(self):
+	# 	"""
+	# 	Build:
+	# 	- self.parent_warehouses: list of parent names
+	# 	- self.parent_qty_map: { parent_wh_name: { item_code: qty, ... }, ... }
+	# 	"""
+	# 	warehouses = frappe.get_all("Warehouse", fields=["name", "parent_warehouse"])
+	# 	wh_map = {w.name: w.parent_warehouse for w in warehouses}
+
+	# 	stock_map = {}  # parent_wh -> { item_code: qty }
+
+	# 	for (item_code, wh), bin_data in (self.bin_details or {}).items():
+	# 		qty = flt(bin_data.get("actual_qty", 0))
+	# 		if qty <= 0:
+	# 			continue
+
+	# 		parent = wh_map.get(wh) or wh
+	# 		stock_map.setdefault(parent, {})
+	# 		stock_map[parent][item_code] = stock_map[parent].get(item_code, 0) + qty
+
+	# 	self.parent_qty_map = stock_map
+	# 	self.parent_warehouses = sorted(stock_map.keys())
+
+	# 	frappe.msgprint(f"parent_warehouses: {self.parent_warehouses}")
+	# 	frappe.msgprint(f"parent_qty_map sample: {dict(list(self.parent_qty_map.items())[:5])}")
+
 	def build_parent_warehouse_data(self):
+		"""Build raw_materials_dict with quantities grouped by parent warehouse.
+		Includes all warehouses, keeps 0 and negatives for display.
 		"""
-		Build:
-		- self.parent_warehouses: list of parent names
-		- self.parent_qty_map: { parent_wh_name: { item_code: qty, ... }, ... }
-		"""
-		warehouses = frappe.get_all("Warehouse", fields=["name", "parent_warehouse"])
-		wh_map = {w.name: w.parent_warehouse for w in warehouses}
+		self.raw_materials_dict = {}
 
-		stock_map = {}  # parent_wh -> { item_code: qty }
+		for d in self.raw_materials:
+			item_code = d.item_code
+			warehouse = d.warehouse
+			qty = flt(d.qty)
 
-		for (item_code, wh), bin_data in (self.bin_details or {}).items():
-			qty = flt(bin_data.get("actual_qty", 0))
-			if qty <= 0:
-				continue
+			parent_warehouse = self.parent_warehouses.get(warehouse)
 
-			parent = wh_map.get(wh) or wh
-			stock_map.setdefault(parent, {})
-			stock_map[parent][item_code] = stock_map[parent].get(item_code, 0) + qty
+			# Initialize if not already
+			if item_code not in self.raw_materials_dict:
+				self.raw_materials_dict[item_code] = {}
 
-		self.parent_qty_map = stock_map
-		self.parent_warehouses = sorted(stock_map.keys())
+			# Always include warehouse, even if qty = 0 or negative
+			self.raw_materials_dict[item_code][parent_warehouse] = (
+				self.raw_materials_dict[item_code].get(parent_warehouse, 0) + qty
+			)
 
-		#frappe.msgprint(f"parent_warehouses: {self.parent_warehouses}")
-		#frappe.msgprint(f"parent_qty_map sample: {dict(list(self.parent_qty_map.items())[:5])}")
+		# Ensure all parent warehouses exist in mapping, even if qty not found
+		for item_code in self.raw_materials_dict:
+			for parent_wh in self.parent_warehouses.values():
+				if parent_wh not in self.raw_materials_dict[item_code]:
+					self.raw_materials_dict[item_code][parent_wh] = 0
 
 	def get_columns(self):
 		based_on = self.filters.based_on
